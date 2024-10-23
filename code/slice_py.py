@@ -1,0 +1,205 @@
+from math_py import *
+import numpy as np
+import copy
+import math
+import scipy
+from scipy import linalg
+from scipy.interpolate import interpn
+import skimage.morphology as sk
+import skfmm
+
+def interpolate(data_CT, atm_points, affine):    
+    """
+    Linear interpolation on regular grids.
+    When the points are outside the domain of grids, assign the min value in data_CT
+
+    Parameters:
+    ----------
+    data_CT :    3D numpy array 
+             The HU values on regular grids
+    atm_points :  N X 3 numpy array
+             the coordinates of N points in anatomical coordinate system. 
+    affine :     4 X 4 numpy array 
+             the affine array
+    Returns:
+    ----------
+    inter:     N X 1 numpy array 
+             the interpolated values at atm_points 
+    """
+    a, b, c = data_CT.shape   
+    x = np.linspace(0,a-1,a)
+    y = np.linspace(0,b-1,b)
+    z = np.linspace(0,c-1,c)
+    vx_points = atm_2_vx(atm_points, affine)
+    inter = interpn((x, y, z), data_CT, vx_points, bounds_error = False, fill_value = -1024)
+    return inter
+
+
+def determine_slice_points(ls, z, atm_skeleton, half_side_a, half_side_b, sigma = 6):
+    """
+    Take L (length of ls) slices along centerline and calculate their coordinates of grids in anatomical system.
+
+    Parameters:
+    ----------
+    ls :           list of integer (length L)
+                 Each element is an index of centerline. 
+                 For example, an element 3 means that the third point on the centerline is taken.
+                 i.e. at this point, a slice will be taken.
+    z :            1 X 3 numpy array
+                 the direction in the anatomical coordinate system which we use as a reference to build a colon coordinate system 
+    atm_skeleton :     M X 3 numpy array
+                  the coordinates of M points on the centerline, in the anatomical system
+    half_side_a :      integer
+                 The half side a of slice
+    half_side_b :      integer
+                 The half side b of slice
+    sigma :         integer
+                 Standard deviation for Gaussian kernel, used to adjust how smooth the centerline will become
+  
+    Returns:
+    ----------
+    slice_grid_points:  N X 3 numpy array
+                 the cooridnates of points from L slices, each slice has (2*half_side_a+1)*(2*half_side_b+1) grid points
+                 in the anatomical coordinate system
+    
+    """
+    L = len(ls)
+    side_a = 2 * half_side_a + 1
+    side_b = 2 * half_side_b + 1
+    
+    #allocate for grid points
+    atm_slice_arr = np.zeros((L, side_a * side_b, 3))
+
+    # grids in a colon coordinate system.
+    a = np.linspace(-half_side_a, half_side_a, side_a)
+    b = np.linspace(-half_side_b, half_side_b, side_b)
+    aa, bb = np.meshgrid(a, b)
+    cc = np.zeros(side_a * side_b)
+    idx_slice = (np.vstack([aa.ravel(), bb.ravel(), cc])).T
+
+    # relate colon coordinate system to anatomical system.
+    atm_skeleton = smooth(atm_skeleton, sigma)
+    for idx_l, l in enumerate(ls):
+        #(a) translation
+        ct = atm_skeleton[l]
+        #(b) rotation matrix
+        #w0
+        w2 = atm_skeleton[l + 1] - atm_skeleton[l -1]
+        w2 = w2 / norm(w2)
+        # w0
+        m = -np.dot(w2, z) / np.dot(w2, w2)
+        w0 = m * w2 + z
+        #w0 = np.array([-w2[0]*w2[2], -w2[1]*w2[2], w2[0]*w2[0]+w2[1]*w2[1]]) 
+        w0 = w0 / norm(w0)
+        # w1
+        w1 = np.cross(w0, w2)
+        w1 = w1 / norm(w1)
+        rotation = np.concatenate((w0.reshape(1, -1), w1.reshape(1, -1), w2.reshape(1, -1)), axis=0)
+        
+        # transform grid points into anatomical system
+        atm_slice = np.matmul(idx_slice, rotation)
+        atm_slice = atm_slice + ct
+
+        atm_slice_arr[idx_l] = atm_slice
+        slice_grid_points = atm_slice_arr.reshape(-1,3)
+
+    return slice_grid_points
+
+
+
+def distance_surface(vx_colon, affine):
+    """
+    Transform the colon array into the anatomical coordiante system, and fill the holes generated during scaling with 1
+    Then detect the colon surface in this isotropic system 
+
+    Parameters:
+    ----------
+    vx_colon :     3D numpy array
+               a binary array in voxel coordinate system
+    affine :       4 X 4 numpy array 
+               the affine array
+    Returns:
+    ----------
+    dis_arr :      3D numpy array 
+               element is the minimal distance between this voxel and the colon surface.
+               positive value for outside colon, minus for inside colon
+    origin:       1 X 3 numpy array
+               The position of new-built array[0,0,0] in the original anatomical coordinate system
+               
+    """
+    print("Be patient. It will take some time to calculate the array of min distance to colon")
+    
+    colon_atm_points = (arr_2_atm(vx_colon, affine)).astype(int)
+    colon_atm_arr, origin = approximate_points_atm_to_arr(colon_atm_points)
+    
+    #fill the small holes generated by scaling
+    atm_colon_arr = sk.binary_closing(colon_atm_arr)
+    
+    # distance array
+    atm_colon_arr = atm_colon_arr * 2 - 1
+    dis_arr = skfmm.distance(atm_colon_arr)
+    return dis_arr, origin
+
+def surface_X_slice(slice_grids_points, vx_colon, affine, L, half_side_a, half_side_b, dis_threshold=0.45):
+
+    """
+    Given L slices, calculate the intersections between slices and colon surface in the anatomical coordinate system
+
+    Parameters:
+    ----------
+    slice_grids_points : M X 3 numpy arry
+                  coordinates of points on L slices with size of (2 * half_side_a + 1)*(2 * half_side_b + 1) 
+                  in the anatomical coordinate system 
+    vx_colon :        3D numpy array
+                  a binary array in voxel coordinate system
+    affine :         4 X 4 numpy array 
+                  the affine array
+    L :            integer
+                  the no. of slices
+    half_side_a :      integer
+                  The half side a of slice
+    half_side_b :      integer
+                  The half side b of slice
+    dis_threshold :    float
+                  a distance threshold. 
+                  When the distance between one pixel of slice and any voxel of colon surface is under this threshold, 
+                  we consider this pixel of slice as intersected with colon surface. 
+  
+    Returns:
+    ----------
+    idx_X_lst:       list of list with integer
+                 the outer list has L element, each of which is a list with various length.
+                 Each inner list stores the intersections on corresponding slice, 
+                 in form of the index of intersected point on slice.
+    
+    """   
+    dis_arr, origin = distance_surface(vx_colon, affine)
+    
+    frame_x, frame_y, frame_z = dis_arr.shape
+    side_a = 2 * half_side_a + 1
+    side_b = 2 * half_side_b + 1
+    assert L * side_a * side_b  == slice_grids_points.shape[0]
+    
+    slice_grids_points = slice_grids_points.reshape(L, side_a * side_b, 3)
+    idx_X_lst=[]   
+    for i, slice_i in enumerate(slice_grids_points):
+        idx_X = []
+        slice_i = slice_grids_points[i] - origin
+        for p,point in enumerate(slice_i):
+            x, y, z = point
+            xyz = []
+            for xs in [math.floor(x), math.ceil(x)]:
+                for ys in [math.floor(y), math.ceil(y)]:
+                    for zs in [math.floor(z), math.ceil(z)]:
+                        if xs >= 0 and xs < frame_x and ys >= 0 and ys < frame_y and zs >= 0 and zs < frame_z:
+                            xyz.append([xs, ys, zs])
+            lattice = (np.array(xyz)).reshape(-1,3).astype(int)
+            dis = np.abs(dis_arr[lattice[:,0], lattice[:,1], lattice[:,2]]) 
+            if dis.size != 0:
+                min_dis = np.min(dis)
+                if min_dis < dis_threshold:
+                    idx_X.append(p)
+        idx_X_lst.append(idx_X)
+        #print(f"The calculation has been finished by {(i+1)/L*100}%. Be patient")
+    return idx_X_lst
+
